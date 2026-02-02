@@ -33,6 +33,129 @@ const getAttachmentUrl = (attachment: Attachment): string => {
   return "";
 };
 
+// Thread indent per nesting level (matches main app reply indentation)
+const THREAD_INDENT_PX = 24;
+
+/** Match @Username or @DisplayName at the start of post content. Returns the mentioned username or null. */
+function getReplyMention(content: string | undefined): string | null {
+  if (!content || typeof content !== "string") return null;
+  const trimmed = content.trim();
+  const match = trimmed.match(/^@(\S+)/);
+  return match ? match[1] : null;
+}
+
+/** Build a depth-first ordered list of posts with depth for thread rendering.
+ * Top-level posts first, then each post's replies directly under it (sorted by timestamp),
+ * then nested replies under those, etc. Same ordering as Reddit/main app.
+ * Handles: nested (post.replies), flat (parentPostId), or fallback via @mention in content.
+ */
+function buildThreadOrder(
+  posts: ForumPost[]
+): Array<{ post: ForumPost; depth: number }> {
+  const result: Array<{ post: ForumPost; depth: number }> = [];
+  const seen = new Set<string>();
+  const list = (posts || []).filter((p) => p);
+  const sortByTime = (a: ForumPost, b: ForumPost) =>
+    new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+  const sortByTimeDesc = (a: ForumPost, b: ForumPost) =>
+    new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
+
+  const pushOnce = (post: ForumPost, depth: number): boolean => {
+    const id = post.postId ?? "";
+    if (id && seen.has(id)) return false;
+    if (id) seen.add(id);
+    result.push({ post, depth });
+    return true;
+  };
+
+  const topLevel = list.filter((p) => !p.parentPostId);
+  const hasFlatReplies = list.some((p) => p.parentPostId != null);
+  const hasNestedReplies = list.some((p) => (p.replies || []).length > 0);
+
+  if (hasFlatReplies && topLevel.length > 0) {
+    // Flat list: build tree by parentPostId, then depth-first walk
+    const byParent = new Map<string | null, ForumPost[]>();
+    topLevel.forEach((p) => {
+      const arr = byParent.get(null) || [];
+      arr.push(p);
+      byParent.set(null, arr);
+    });
+    list.forEach((p) => {
+      if (p.parentPostId != null) {
+        const arr = byParent.get(p.parentPostId) || [];
+        arr.push(p);
+        byParent.set(p.parentPostId, arr);
+      }
+    });
+    byParent.forEach((arr) => arr.sort(sortByTime));
+
+    function appendFlat(parentId: string | null, depth: number) {
+      const children = byParent.get(parentId) || [];
+      children.forEach((p) => {
+        if (!pushOnce(p, depth)) return;
+        appendFlat(p.postId ?? "", depth + 1);
+      });
+    }
+    const roots = (byParent.get(null) || []).slice().sort(sortByTimeDesc);
+    roots.forEach((p) => {
+      if (!pushOnce(p, 0)) return;
+      appendFlat(p.postId ?? "", 1);
+    });
+    return result;
+  }
+
+  if (hasNestedReplies) {
+    // Nested structure: same post can appear in multiple parents' replies — output each postId once
+    function append(post: ForumPost, depth: number) {
+      if (!pushOnce(post, depth)) return;
+      const replies = (post.replies || []).filter((r) => r).slice();
+      replies.sort(sortByTime);
+      replies.forEach((r) => append(r, depth + 1));
+    }
+    topLevel.sort(sortByTimeDesc);
+    topLevel.forEach((p) => append(p, 0));
+    return result;
+  }
+
+  // Fallback: no parentPostId and no nested replies — infer replies from @mention at start of content
+  const sorted = list.slice().sort(sortByTime);
+  const authorToLastPost = new Map<string, ForumPost>();
+  const inferredParentId = new Map<string, string>();
+  for (const p of sorted) {
+    const mention = getReplyMention(p.content);
+    const pid = p.postId ?? "";
+    if (mention) {
+      const parent = authorToLastPost.get(mention);
+      if (parent && parent.postId) inferredParentId.set(pid, parent.postId);
+    }
+    if (p.author) authorToLastPost.set(p.author, p);
+  }
+
+  const byParent = new Map<string | null, ForumPost[]>();
+  sorted.forEach((p) => {
+    const parentId =
+      p.parentPostId ?? inferredParentId.get(p.postId ?? "") ?? null;
+    const arr = byParent.get(parentId) || [];
+    arr.push(p);
+    byParent.set(parentId, arr);
+  });
+  byParent.forEach((arr) => arr.sort(sortByTime));
+
+  function appendFlat(parentId: string | null, depth: number) {
+    const children = byParent.get(parentId) || [];
+    children.forEach((p) => {
+      if (!pushOnce(p, depth)) return;
+      appendFlat(p.postId ?? "", depth + 1);
+    });
+  }
+  const roots = (byParent.get(null) || []).slice().sort(sortByTimeDesc);
+  roots.forEach((p) => {
+    if (!pushOnce(p, 0)) return;
+    appendFlat(p.postId ?? "", 1);
+  });
+  return result;
+}
+
 const ForumPreview: React.FC<ForumPreviewProps> = ({
   initialLimit = 5,
   userId,
@@ -502,13 +625,16 @@ const ForumPreview: React.FC<ForumPreviewProps> = ({
               (post: any) => !post?.categoryDisplayName && post?.gameTitle
             );
             if (postsWithoutCategory.length > 0) {
-              console.log("Posts without categoryDisplayName:", postsWithoutCategory.map((p: any) => ({
-                gameTitle: p?.gameTitle,
-                categoryDisplayName: p?.categoryDisplayName,
-                forumTitle: p?.forumTitle,
-                category: p?.category,
-                allKeys: Object.keys(p || {})
-              })));
+              console.log(
+                "Posts without categoryDisplayName:",
+                postsWithoutCategory.map((p: any) => ({
+                  gameTitle: p?.gameTitle,
+                  categoryDisplayName: p?.categoryDisplayName,
+                  forumTitle: p?.forumTitle,
+                  category: p?.category,
+                  allKeys: Object.keys(p || {}),
+                }))
+              );
             }
           }
 
@@ -517,13 +643,14 @@ const ForumPreview: React.FC<ForumPreviewProps> = ({
           const safePosts = (response.data.posts || []).map((post: any) => {
             // Preserve categoryDisplayName if it exists, even if it's an empty string
             // Also check for alternative field names
-            const categoryDisplayName = 
-              post?.categoryDisplayName !== undefined && post?.categoryDisplayName !== null
+            const categoryDisplayName =
+              post?.categoryDisplayName !== undefined &&
+              post?.categoryDisplayName !== null
                 ? String(post.categoryDisplayName).trim() || null
                 : post?.category !== undefined && post?.category !== null
                 ? String(post.category).trim() || null
                 : null;
-            
+
             return {
               ...post,
               gameTitle: post?.gameTitle || null,
@@ -532,13 +659,14 @@ const ForumPreview: React.FC<ForumPreviewProps> = ({
               forumId: post?.forumId || null,
               parentPostId: post?.parentPostId || null,
               replies: (post?.replies || []).map((reply: any) => {
-                const replyCategoryDisplayName = 
-                  reply?.categoryDisplayName !== undefined && reply?.categoryDisplayName !== null
+                const replyCategoryDisplayName =
+                  reply?.categoryDisplayName !== undefined &&
+                  reply?.categoryDisplayName !== null
                     ? String(reply.categoryDisplayName).trim() || null
                     : reply?.category !== undefined && reply?.category !== null
                     ? String(reply.category).trim() || null
                     : null;
-                
+
                 return {
                   ...reply,
                   gameTitle: reply?.gameTitle || null,
@@ -1670,345 +1798,269 @@ const ForumPreview: React.FC<ForumPreviewProps> = ({
 
       <div className="forum-posts-container" ref={scrollContainerRef}>
         {Array.isArray(posts) && posts.length > 0 ? (
-          posts
-            .filter((post) => post && !post.parentPostId) // Only show top-level posts
-            .map((post, index) => {
-              // Strict null checks - ensure post is a valid object
-              if (!post || typeof post !== "object") return null;
-              // Safe access to all post properties with strict type checks
-              const gameTitle =
-                post && typeof post === "object" && "gameTitle" in post
-                  ? typeof post.gameTitle === "string"
-                    ? post.gameTitle
-                    : null
-                  : null;
-              // Try categoryDisplayName first, fallback to forumTitle if not available
-              const categoryDisplayName =
-                post && typeof post === "object" && "categoryDisplayName" in post
-                  ? typeof post.categoryDisplayName === "string" && post.categoryDisplayName.trim()
-                    ? post.categoryDisplayName.trim()
-                    : null
-                  : null;
-              const forumTitle =
-                post && typeof post === "object" && "forumTitle" in post
-                  ? typeof post.forumTitle === "string"
-                    ? post.forumTitle
-                    : null
-                  : null;
-              
-              // Clean category name by removing redundant game title prefix
-              const cleanCategoryName = (category: string | null, game: string | null): string | null => {
-                if (!category || !game) return category;
-                
-                // Remove game title prefix if it exists (handles "Game Title - Category" or "Game Title -Category")
-                const prefixPattern = new RegExp(`^${game.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*-\\s*`, 'i');
-                const cleaned = category.replace(prefixPattern, '').trim();
-                
-                // Return cleaned category if it's different, otherwise return original
-                return cleaned && cleaned !== category ? cleaned : category;
-              };
-              
-              // Fallback: use forumTitle if categoryDisplayName is not available
-              const categoryName = cleanCategoryName(
-                categoryDisplayName || 
-                (forumTitle && typeof forumTitle === "string" && forumTitle.trim() ? forumTitle.trim() : null),
-                gameTitle
+          buildThreadOrder(posts).map(({ post, depth }, index) => {
+            // Strict null checks - ensure post is a valid object
+            if (!post || typeof post !== "object") return null;
+            // Safe access to all post properties with strict type checks
+            const gameTitle =
+              post && typeof post === "object" && "gameTitle" in post
+                ? typeof post.gameTitle === "string"
+                  ? post.gameTitle
+                  : null
+                : null;
+            // Try categoryDisplayName first, fallback to forumTitle if not available
+            const categoryDisplayName =
+              post && typeof post === "object" && "categoryDisplayName" in post
+                ? typeof post.categoryDisplayName === "string" &&
+                  post.categoryDisplayName.trim()
+                  ? post.categoryDisplayName.trim()
+                  : null
+                : null;
+            const forumTitle =
+              post && typeof post === "object" && "forumTitle" in post
+                ? typeof post.forumTitle === "string"
+                  ? post.forumTitle
+                  : null
+                : null;
+
+            // Clean category name by removing redundant game title prefix
+            const cleanCategoryName = (
+              category: string | null,
+              game: string | null
+            ): string | null => {
+              if (!category || !game) return category;
+
+              // Remove game title prefix if it exists (handles "Game Title - Category" or "Game Title -Category")
+              const prefixPattern = new RegExp(
+                `^${game.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*-\\s*`,
+                "i"
               );
-              const forumId =
-                post && typeof post === "object" && "forumId" in post
-                  ? typeof post.forumId === "string"
-                    ? post.forumId
-                    : null
-                  : null;
+              const cleaned = category.replace(prefixPattern, "").trim();
 
-              // Ensure we have required fields before rendering
-              if (!post.author || !post.content || !post.timestamp) {
-                if (process.env.NODE_ENV === "development") {
-                  console.warn("Post missing required fields:", post);
-                }
-                return null;
+              // Return cleaned category if it's different, otherwise return original
+              return cleaned && cleaned !== category ? cleaned : category;
+            };
+
+            // Fallback: use forumTitle if categoryDisplayName is not available
+            const categoryName = cleanCategoryName(
+              categoryDisplayName ||
+                (forumTitle &&
+                typeof forumTitle === "string" &&
+                forumTitle.trim()
+                  ? forumTitle.trim()
+                  : null),
+              gameTitle
+            );
+            const forumId =
+              post && typeof post === "object" && "forumId" in post
+                ? typeof post.forumId === "string"
+                  ? post.forumId
+                  : null
+                : null;
+
+            // Ensure we have required fields before rendering
+            if (!post.author || !post.content || !post.timestamp) {
+              if (process.env.NODE_ENV === "development") {
+                console.warn("Post missing required fields:", post);
               }
+              return null;
+            }
 
-              return (
-                <div
-                  // Use index-based key to guarantee uniqueness across pages
-                  key={`post-${index}`}
-                  className="forum-post-preview"
-                >
-                  {/* Game title badge */}
-                  {gameTitle && typeof gameTitle === "string" && (
-                    <div
-                      className="post-game-badge"
-                      style={{
-                        display: "inline-block",
-                        padding: "4px 8px",
-                        backgroundColor: "#f0f0f0",
+            const isReply = depth > 0;
+            const indentPx = depth * THREAD_INDENT_PX;
+
+            return (
+              <div
+                key={post.postId ? `post-${post.postId}` : `post-${index}`}
+                className={
+                  isReply
+                    ? "reply-post forum-post-preview"
+                    : "forum-post-preview"
+                }
+                style={{
+                  marginLeft: indentPx,
+                  marginBottom: "10px",
+                  ...(isReply
+                    ? {
+                        paddingLeft: "15px",
+                        borderLeft: "2px solid rgba(224, 224, 224, 0.4)",
+                        padding: "10px",
+                        backgroundColor: "rgba(255, 255, 255, 0.04)",
                         borderRadius: "4px",
-                        fontSize: "0.85rem",
-                        marginBottom: "8px",
-                        color: "#e94560",
+                      }
+                    : {}),
+                }}
+              >
+                {/* Game title badge */}
+                {gameTitle && typeof gameTitle === "string" && (
+                  <div
+                    className="post-game-badge"
+                    style={{
+                      display: "inline-block",
+                      padding: "4px 8px",
+                      backgroundColor: "#f0f0f0",
+                      borderRadius: "4px",
+                      fontSize: "0.85rem",
+                      marginBottom: "8px",
+                      color: "#e94560",
+                      fontWeight: 600,
+                    }}
+                  >
+                    {categoryName
+                      ? `${gameTitle} (${categoryName})`
+                      : gameTitle}
+                  </div>
+                )}
+                <div className="post-header">
+                  <span className="post-author">
+                    {isReply ? "Reply by " : "Posted by "}
+                    {post.author}
+                  </span>
+                  <span
+                    className="post-date"
+                    style={
+                      isReply
+                        ? { color: "rgba(255, 255, 255, 0.85)" }
+                        : undefined
+                    }
+                  >
+                    on {formatDate(post.timestamp)}
+                    {post.edited && post.editedAt && (
+                      <span className="post-edited">
+                        {" "}
+                        (edited on {formatDate(post.editedAt)})
+                      </span>
+                    )}
+                  </span>
+                </div>
+                <div className="post-content">{post.content}</div>
+                {post.attachments && post.attachments.length > 0 && (
+                  <div className="post-attachments">
+                    {post.attachments.map((attachment, imgIndex) => {
+                      const imageUrl = getAttachmentUrl(attachment);
+                      if (!imageUrl) return null;
+                      return (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          key={imgIndex}
+                          src={imageUrl}
+                          alt={`Attachment ${imgIndex + 1}`}
+                          className="post-image"
+                          loading="lazy"
+                          onError={(e) => {
+                            e.currentTarget.style.display = "none";
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                )}
+                <div className="post-footer">
+                  {userId && post.postId ? (
+                    <button
+                      className={`like-button ${post.isLiked ? "liked" : ""}`}
+                      onClick={() =>
+                        handleLikePost(post.postId!, post.isLiked || false)
+                      }
+                      disabled={likingPostId === post.postId}
+                      title={
+                        post.isLiked ? "Unlike this post" : "Like this post"
+                      }
+                    >
+                      <span className="like-icon">
+                        {post.isLiked ? "❤️" : "🤍"}
+                      </span>
+                      <span className="like-count">
+                        {likingPostId === post.postId
+                          ? "..."
+                          : `${post.likes} ${
+                              post.likes === 1 ? "Like" : "Likes"
+                            }`}
+                      </span>
+                    </button>
+                  ) : (
+                    <span className="post-likes">
+                      ❤️ {post.likes} {post.likes === 1 ? "Like" : "Likes"}
+                    </span>
+                  )}
+                  {post.postId && (
+                    <button
+                      className="reply-button"
+                      onClick={() => handleStartReply(post.postId!)}
+                      style={{
+                        marginLeft: "10px",
+                        padding: "4px 10px",
+                        backgroundColor: "rgba(233, 69, 96, 0.15)",
+                        border: "1px solid #e94560",
+                        borderRadius: "999px",
+                        cursor: "pointer",
+                        color: "#ffffff",
+                        fontSize: "0.8rem",
                         fontWeight: 600,
                       }}
                     >
-                      {categoryName
-                        ? `${gameTitle} (${categoryName})`
-                        : gameTitle}
-                    </div>
-                  )}
-                  <div className="post-header">
-                    <span className="post-author">Posted by {post.author}</span>
-                    <span className="post-date">
-                      on {formatDate(post.timestamp)}
-                      {post.edited && post.editedAt && (
-                        <span className="post-edited">
-                          {" "}
-                          (edited on {formatDate(post.editedAt)})
-                        </span>
-                      )}
-                    </span>
-                  </div>
-                  <div className="post-content">{post.content}</div>
-                  {post.attachments && post.attachments.length > 0 && (
-                    <div className="post-attachments">
-                      {post.attachments.map((attachment, imgIndex) => {
-                        const imageUrl = getAttachmentUrl(attachment);
-                        if (!imageUrl) return null;
-                        return (
-                          // eslint-disable-next-line @next/next/no-img-element
-                          <img
-                            key={imgIndex}
-                            src={imageUrl}
-                            alt={`Attachment ${imgIndex + 1}`}
-                            className="post-image"
-                            loading="lazy"
-                            onError={(e) => {
-                              e.currentTarget.style.display = "none";
-                            }}
-                          />
-                        );
-                      })}
-                    </div>
-                  )}
-                  <div className="post-footer">
-                    {userId && post.postId ? (
-                      <button
-                        className={`like-button ${post.isLiked ? "liked" : ""}`}
-                        onClick={() =>
-                          handleLikePost(post.postId!, post.isLiked || false)
-                        }
-                        disabled={likingPostId === post.postId}
-                        title={
-                          post.isLiked ? "Unlike this post" : "Like this post"
-                        }
-                      >
-                        <span className="like-icon">
-                          {post.isLiked ? "❤️" : "🤍"}
-                        </span>
-                        <span className="like-count">
-                          {likingPostId === post.postId
-                            ? "..."
-                            : `${post.likes} ${
-                                post.likes === 1 ? "Like" : "Likes"
-                              }`}
-                        </span>
-                      </button>
-                    ) : (
-                      <span className="post-likes">
-                        ❤️ {post.likes} {post.likes === 1 ? "Like" : "Likes"}
-                      </span>
-                    )}
-                    {post.postId && (
-                      <button
-                        className="reply-button"
-                        onClick={() => handleStartReply(post.postId!)}
-                        style={{
-                          marginLeft: "10px",
-                          padding: "4px 10px",
-                          backgroundColor: "rgba(233, 69, 96, 0.15)",
-                          border: "1px solid #e94560",
-                          borderRadius: "999px",
-                          cursor: "pointer",
-                          color: "#ffffff",
-                          fontSize: "0.8rem",
-                          fontWeight: 600,
-                        }}
-                      >
-                        Reply
-                      </button>
-                    )}
-                  </div>
-
-                  {/* Reply input */}
-                  {replyingToPostId === post.postId && (
-                    <div
-                      className="reply-input-container"
-                      style={{
-                        marginLeft: "20px",
-                        marginTop: "10px",
-                        padding: "10px",
-                        backgroundColor: "#f9f9f9",
-                        borderRadius: "4px",
-                        border: "1px solid #e0e0e0",
-                      }}
-                    >
-                      <textarea
-                        className="post-textarea"
-                        value={replyContent}
-                        onChange={(e) => setReplyContent(e.target.value)}
-                        placeholder="Write your reply..."
-                        rows={3}
-                        disabled={postingReply}
-                        style={{ width: "100%", marginBottom: "8px" }}
-                      />
-                      <div style={{ display: "flex", gap: "8px" }}>
-                        <button
-                          onClick={() => handleSubmitReply(post.postId!)}
-                          disabled={postingReply || !replyContent.trim()}
-                          style={{
-                            padding: "6px 12px",
-                            backgroundColor: "#007bff",
-                            color: "white",
-                            border: "none",
-                            borderRadius: "4px",
-                            cursor: "pointer",
-                          }}
-                        >
-                          {postingReply ? "Posting..." : "Post Reply"}
-                        </button>
-                        <button
-                          onClick={handleCancelReply}
-                          disabled={postingReply}
-                          style={{
-                            padding: "6px 12px",
-                            backgroundColor: "#ccc",
-                            color: "black",
-                            border: "none",
-                            borderRadius: "4px",
-                            cursor: "pointer",
-                          }}
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Nested Replies */}
-                  {post.replies && post.replies.length > 0 && (
-                    <div
-                      className="replies-container"
-                      style={{
-                        marginLeft: "20px",
-                        marginTop: "10px",
-                        paddingLeft: "15px",
-                        borderLeft: "2px solid #e0e0e0",
-                      }}
-                    >
-                      {post.replies
-                        .filter((reply) => reply) // Filter out any undefined replies
-                        .map((reply, replyIndex) => {
-                          // Safe access to reply properties
-                          if (!reply) return null;
-                          return (
-                            <div
-                              // Ensure unique key even if replyIds repeat
-                              key={`reply-${index}-${replyIndex}`}
-                              className="reply-post"
-                              style={{
-                                marginBottom: "10px",
-                                padding: "10px",
-                                backgroundColor: "#f9f9f9",
-                                borderRadius: "4px",
-                              }}
-                            >
-                              <div className="post-header">
-                                <span className="post-author">
-                                  Reply by {reply.author}
-                                </span>
-                                <span className="post-date">
-                                  on {formatDate(reply.timestamp)}
-                                  {reply.edited && reply.editedAt && (
-                                    <span className="post-edited">
-                                      {" "}
-                                      (edited on {formatDate(reply.editedAt)})
-                                    </span>
-                                  )}
-                                </span>
-                              </div>
-                              <div className="post-content">
-                                {reply.content}
-                              </div>
-                              {reply.attachments &&
-                                reply.attachments.length > 0 && (
-                                  <div className="post-attachments">
-                                    {reply.attachments.map(
-                                      (attachment, imgIndex) => {
-                                        const imageUrl =
-                                          getAttachmentUrl(attachment);
-                                        if (!imageUrl) return null;
-                                        return (
-                                          // eslint-disable-next-line @next/next/no-img-element
-                                          <img
-                                            key={imgIndex}
-                                            src={imageUrl}
-                                            alt={`Attachment ${imgIndex + 1}`}
-                                            className="post-image"
-                                            loading="lazy"
-                                            onError={(e) => {
-                                              e.currentTarget.style.display =
-                                                "none";
-                                            }}
-                                          />
-                                        );
-                                      }
-                                    )}
-                                  </div>
-                                )}
-                              <div className="post-footer">
-                                {userId && reply.postId ? (
-                                  <button
-                                    className={`like-button ${
-                                      reply.isLiked ? "liked" : ""
-                                    }`}
-                                    onClick={() =>
-                                      handleLikePost(
-                                        reply.postId!,
-                                        reply.isLiked || false
-                                      )
-                                    }
-                                    disabled={likingPostId === reply.postId}
-                                    title={
-                                      reply.isLiked
-                                        ? "Unlike this reply"
-                                        : "Like this reply"
-                                    }
-                                  >
-                                    <span className="like-icon">
-                                      {reply.isLiked ? "❤️" : "🤍"}
-                                    </span>
-                                    <span className="like-count">
-                                      {likingPostId === reply.postId
-                                        ? "..."
-                                        : `${reply.likes} ${
-                                            reply.likes === 1 ? "Like" : "Likes"
-                                          }`}
-                                    </span>
-                                  </button>
-                                ) : (
-                                  <span className="post-likes">
-                                    ❤️ {reply.likes}{" "}
-                                    {reply.likes === 1 ? "Like" : "Likes"}
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                    </div>
+                      Reply
+                    </button>
                   )}
                 </div>
-              );
-            })
+
+                {/* Reply input */}
+                {replyingToPostId === post.postId && (
+                  <div
+                    className="reply-input-container"
+                    style={{
+                      marginLeft: "20px",
+                      marginTop: "10px",
+                      padding: "10px",
+                      backgroundColor: "#f9f9f9",
+                      borderRadius: "4px",
+                      border: "1px solid #e0e0e0",
+                    }}
+                  >
+                    <textarea
+                      className="post-textarea"
+                      value={replyContent}
+                      onChange={(e) => setReplyContent(e.target.value)}
+                      placeholder="Write your reply..."
+                      rows={3}
+                      disabled={postingReply}
+                      style={{ width: "100%", marginBottom: "8px" }}
+                    />
+                    <div style={{ display: "flex", gap: "8px" }}>
+                      <button
+                        onClick={() => handleSubmitReply(post.postId!)}
+                        disabled={postingReply || !replyContent.trim()}
+                        style={{
+                          padding: "6px 12px",
+                          backgroundColor: "#007bff",
+                          color: "white",
+                          border: "none",
+                          borderRadius: "4px",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {postingReply ? "Posting..." : "Post Reply"}
+                      </button>
+                      <button
+                        onClick={handleCancelReply}
+                        disabled={postingReply}
+                        style={{
+                          padding: "6px 12px",
+                          backgroundColor: "#ccc",
+                          color: "black",
+                          border: "none",
+                          borderRadius: "4px",
+                          cursor: "pointer",
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })
         ) : (
           <p
             className="preview-loading-text"
