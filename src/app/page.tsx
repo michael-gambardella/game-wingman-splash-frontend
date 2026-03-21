@@ -25,6 +25,7 @@ const SplashPage: React.FC = () => {
   const [formState, setFormState] = useState<FormState>(initialFormState);
   const [verifiedUserId, setVerifiedUserId] = useState<string | null>(null);
   const [verifiedEmail, setVerifiedEmail] = useState<string | null>(null);
+  const [isApproved, setIsApproved] = useState(false);
   const [isVerifying, setIsVerifying] = useState(false);
 
   const handleEmailChange = useCallback(
@@ -49,6 +50,9 @@ const SplashPage: React.FC = () => {
       if (response.data.success && response.data.userId) {
         setVerifiedUserId(response.data.userId);
         setVerifiedEmail(response.data.email || email);
+        if (response.data.isApproved) {
+          setIsApproved(true);
+        }
         return true;
       }
       return false;
@@ -84,9 +88,11 @@ const SplashPage: React.FC = () => {
           );
           if (checkResponse.data.success && checkResponse.data.userId) {
             wasAlreadyOnWaitlistBefore = true;
-            // Also set verified state since we found them
             setVerifiedUserId(checkResponse.data.userId);
             setVerifiedEmail(checkResponse.data.email || formState.email);
+            if (checkResponse.data.isApproved) {
+              setIsApproved(true);
+            }
           }
         } catch (error) {
           // User not found, so this is a new signup
@@ -134,6 +140,10 @@ const SplashPage: React.FC = () => {
           userId: userId,
           loading: false,
         }));
+
+        if (response.data.isApproved) {
+          setIsApproved(true);
+        }
 
         // If user was added to waitlist (has userId), verify them for posting
         if (userId) {
@@ -247,11 +257,10 @@ const SplashPage: React.FC = () => {
           <p style={{ whiteSpace: "pre-line" }}>{formState.message}</p>
         </div>
       )}
-      {(formState.link || verifiedUserId) && (
+      {(formState.link || (verifiedUserId && isApproved)) && (
         <div className="assistant-access-message">
           <p className="assistant-access-text">
-            {formState.link ? "You have been approved!" : "You have access!"}{" "}
-            Access Video Game Wingman:
+            You have access! Access Video Game Wingman:
           </p>
           <a
             href={
